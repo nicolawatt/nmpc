@@ -70,9 +70,26 @@ class Controller:
         #cost function
         obj = 0
         for i in range(self.N):
-            state_error = self.opt_states[i, :] - self.opt_x_ref[i+1, :]
+            #position errors
+            pos_error = self.opt_states[i, :2] - self.opt_x_ref[i+1, :2]
+        
+            #angle error with unwrapping
+            theta_current = self.opt_states[i, 2]
+            theta_ref = self.opt_x_ref[i+1, 2]
+            angle_error = ca.if_else(
+                ca.fabs(theta_current - theta_ref) > ca.pi,
+                ca.if_else(
+                    theta_current > theta_ref,
+                    theta_current - theta_ref - 2*ca.pi,
+                    theta_current - theta_ref + 2*ca.pi
+                ),
+                theta_current - theta_ref
+            )
+        
+            state_error = ca.vertcat(pos_error[0], pos_error[1], angle_error)
             control_error = self.opt_controls[i, :] - self.opt_u_ref[i, :]
-            obj = obj + ca.mtimes([state_error, self.Q, state_error.T]) #+ ca.mtimes([control_error, self.R, control_error.T])
+            obj = obj + ca.mtimes([state_error.T, self.Q, state_error]) + ca.mtimes([control_error, self.R, control_error.T])
+        
         self.opti.minimize(obj)
 
         #change in control input constraints
@@ -107,6 +124,9 @@ class Controller:
             self.next_states[0] = current_state
             for i in range(1, self.N+1):
                 self.next_states[i] = next_trajectories[i]
+
+            #unwrap angles
+            self.next_states[:, 2] = np.unwrap(self.next_states[:, 2])
 
         #initial guess for optimisation
         self.opti.set_initial(self.opt_states, self.next_states)
