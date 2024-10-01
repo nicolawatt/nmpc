@@ -65,7 +65,7 @@ class NMPCNode(Node):
         self.plotter_address = ('196.24.154.99', 12345) #hardcoded address for external plotter
 
         #path-following behaviour options: 'stop' or 'repeat'
-        self.path_type = 'stop'
+        self.path_type = 'repeat'
         self.stop = False 
 
     def load_trajectory(self):
@@ -137,6 +137,9 @@ class NMPCNode(Node):
                     self.reference_trajectory[self.trajectory_index:],
                     np.tile(self.reference_trajectory[-1], (N+1-remaining_points, 1))
                 ))
+
+        #unwrap angles in reference trajectory
+        ref_traj[:, 2] = np.unwrap(ref_traj[:, 2])
         
         #update trajectory index
         self.trajectory_index += 1
@@ -164,36 +167,56 @@ class NMPCNode(Node):
         #send data as json encoded udp
         self.socket.sendto(json.dumps(trajectory_data).encode(), self.plotter_address)
 
+    def unwrap_current_state(self, current_state, ref_trajectory):
+        #unwrap current yaw relative to reference trajectory
+        ref_angle = ref_trajectory[0, 2]
+        current_angle = current_state[2]
+    
+        #calculate difference
+        diff = current_angle - ref_angle
+    
+        #adjust for wrap-around
+        if abs(diff) > np.pi:
+            if diff > 0:
+                current_angle -= 2 * np.pi
+            else:
+                current_angle += 2 * np.pi
+    
+        return np.array([current_state[0], current_state[1], current_angle])
+
     def control_loop(self):
     #control loop runs periodically
         if not self.odom_received:
             #wait for odometry data
             self.get_logger().info('Waiting for initial odometry data...')
             return
-        else:
-            #get reference trajectory for next N steps
-            ref_trajectory = self.reference_trajectory_N()
-
-            #create array of zero reference controls (ie ideal control is v=0, w=0)
-            ref_controls = np.zeros((self.controller.N, 2))
         
-            #solve nmpc problem
-            optimal_control = self.controller.solve(self.current_state, ref_trajectory, ref_controls)
+        #get reference trajectory for next N steps
+        ref_trajectory = self.reference_trajectory_N()
 
-            #create and publish velocity command
-            cmd_vel_msg = Twist()
-            if self.stop == True:
-                #stop
-                cmd_vel_msg.linear.x = 0.0
-                cmd_vel_msg.angular.z = 0.0
-            else:
-                cmd_vel_msg.linear.x = float(optimal_control[0])
-                cmd_vel_msg.angular.z = float(optimal_control[1])
+        #create array of zero reference controls (ie ideal control is v=0, w=0)
+        ref_controls = np.zeros((self.controller.N, 2))
+
+        #unwrap current state
+        current_state_unwrapped = self.unwrap_current_state(self.current_state, ref_trajectory)
+        
+        #solve nmpc problem
+        optimal_control = self.controller.solve(current_state_unwrapped, ref_trajectory, ref_controls)
+
+        #create and publish velocity command
+        cmd_vel_msg = Twist()
+        if self.stop == True:
+            #stop
+            cmd_vel_msg.linear.x = 0.0
+            cmd_vel_msg.angular.z = 0.0
+        else:
+            cmd_vel_msg.linear.x = float(optimal_control[0])
+            cmd_vel_msg.angular.z = float(optimal_control[1])
     
-            self.cmd_vel_pub.publish(cmd_vel_msg)
+        self.cmd_vel_pub.publish(cmd_vel_msg)
 
-            #send trajectory data for plotting
-            self.send_data()
+        #send trajectory data for plotting
+        self.send_data()
         
 def destroy_node(self):
 #function to close udp socket and destroy controller node
