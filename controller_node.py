@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
 import numpy as np
 import csv
 import socket
 import json
+import time
+import rclpy
+from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-
 from .controller_class import Controller  
 
 class NMPCNode(Node):
+    PLOTTER_ADDRESS = ('196.24.156.197', 12345)     #hardcoded ip address for external plotter
+    N = 20                                          #prediction horizon
+    PATH_TYPE = 'repeat'                            #path-following behaviour options: 'stop' or 'repeat'
+
     def __init__(self):
         super().__init__('nmpc_controller_node')
+
+        self._init_parameters
+        self._init_state_variables
+        self._init_communication
+        self._init_controller
         
+    def _init_parameters(self):
         #load parameters
         self.declare_parameter('rate', 10)
         self.declare_parameter('trajectory_file', '/home/voyager/data/nicola_watt/trajectories/recorded_odometry.csv')
@@ -26,19 +36,22 @@ class NMPCNode(Node):
         self.rate = self.get_parameter('rate').value
         self.csv_file = self.get_parameter('trajectory_file').value
 
+    def _init_state_variables(self):
         #initialise state variables
         self.current_state = None
+
+        #initialise previous control
+        self.previous_control = np.zeros(2)
         
         #initialize data storage for robot trajectory
         self.actual_trajectory = []
         
         #load reference trajectory from csv file
         self.reference_trajectory = self.load_trajectory()
-        
+          
+    def _init_communication(self):
         #initialise ROS publishers and subscribers
-        #to publish velocity commands 
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        #to subscribe to odometry
         self.odom_sub = self.create_subscription(Odometry, 'odometry', self.odom_callback, 10)
 
         #wait for initial position
@@ -46,7 +59,11 @@ class NMPCNode(Node):
         self.initial_position = None
         while not self.initial_position_received:
             rclpy.spin_once(self)
-
+    
+        #create udp socket to send trajectory data to external plotter
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    def _init_controller(self):
         #get controller parameters
         min_v = self.get_parameter('min_v').value
         max_v = self.get_parameter('max_v').value
@@ -54,18 +71,14 @@ class NMPCNode(Node):
         max_w = self.get_parameter('max_w').value
         
         #initialise nmpc controller with initial position and parameters
-        self.controller = Controller(min_v, max_v, min_w, max_w, T=1.0/self.rate, N=10)
+        self.controller = Controller(min_v, max_v, min_w, max_w, T=1.0/self.rate, N=self.N)
         self.trajectory_index = 0
         
         #timer for control loop
         self.timer = self.create_timer(1.0/self.rate, self.control_loop)
 
-        #create udp socket to send trajectory data to external plotter
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.plotter_address = ('196.24.154.99', 12345) #hardcoded address for external plotter
-
         #path-following behaviour options: 'stop' or 'repeat'
-        self.path_type = 'repeat'
+        self.path_type = self.PATH_TYPE
         self.stop = False 
 
     def load_trajectory(self):
@@ -96,8 +109,7 @@ class NMPCNode(Node):
         if not self.initial_position_received:
             self.initial_position = self.current_state
             self.initial_position_received = True
-            #self.get_logger().info(f'Initial position set to: {self.initial_position}')
-
+            
         self.odom_received = True
 
     def euler_from_quaternion(self, quaternion):
@@ -162,10 +174,13 @@ class NMPCNode(Node):
             'actual_y' : float(self.current_state[1]),
             'forecast_x': self.controller.next_states[:, 0].tolist() if hasattr(self.controller, 'next_states') else [],
             'forecast_y': self.controller.next_states[:, 1].tolist() if hasattr(self.controller, 'next_states') else [], 
+            'v' : float(self.optimal_control[0]),
+            'w' : float(self.optimal_control[1]),
+            'optimisation_time' : float(self.time_taken)
         }
 
         #send data as json encoded udp
-        self.socket.sendto(json.dumps(trajectory_data).encode(), self.plotter_address)
+        self.socket.sendto(json.dumps(trajectory_data).encode(), self.PLOTTER_ADDRESS)
 
     def unwrap_current_state(self, current_state, ref_trajectory):
         #unwrap current yaw relative to reference trajectory
@@ -194,15 +209,22 @@ class NMPCNode(Node):
         #get reference trajectory for next N steps
         ref_trajectory = self.reference_trajectory_N()
 
-        #create array of zero reference controls (ie ideal control is v=0, w=0)
-        ref_controls = np.zeros((self.controller.N, 2))
+        #create array of reference controls based on previous controls (ie minimise change in control)
+        ref_controls = np.tile(self.previous_control, (self.controller.N, 1))
 
         #unwrap current state
         current_state_unwrapped = self.unwrap_current_state(self.current_state, ref_trajectory)
         
-        #solve nmpc problem
-        optimal_control = self.controller.solve(current_state_unwrapped, ref_trajectory, ref_controls)
+        #log start time
+        start_time = time.time()
 
+        #solve nmpc problem
+        self.optimal_control = self.controller.solve(current_state_unwrapped, ref_trajectory, ref_controls)
+
+        #log end time and compute time taken for optimisation calculation
+        end_time = time.time()
+        self.time_taken = end_time - start_time
+        
         #create and publish velocity command
         cmd_vel_msg = Twist()
         if self.stop == True:
@@ -210,8 +232,9 @@ class NMPCNode(Node):
             cmd_vel_msg.linear.x = 0.0
             cmd_vel_msg.angular.z = 0.0
         else:
-            cmd_vel_msg.linear.x = float(optimal_control[0])
-            cmd_vel_msg.angular.z = float(optimal_control[1])
+            #apply optimal control inputs
+            cmd_vel_msg.linear.x = float(self.optimal_control[0])
+            cmd_vel_msg.angular.z = float(self.optimal_control[1])
     
         self.cmd_vel_pub.publish(cmd_vel_msg)
 
