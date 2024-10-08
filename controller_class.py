@@ -13,7 +13,7 @@ class Controller:
 
         #cost function weight matrices
         self.Q = np.diag([100, 100, 10])
-        self.R = np.diag([1, 1])
+        self.R = np.diag([10, 10])
 
         #linear and angular velocity costraints
         self.min_v = min_v
